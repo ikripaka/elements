@@ -7,31 +7,30 @@ set -eo pipefail
 BASE_ORIG=merged-master
 BASE="${BASE_ORIG}"
 BITCOIN_UPSTREAM_REMOTE=bitcoin
-export BITCOIN_UPSTREAM="${BITCOIN_UPSTREAM_REMOTE}/master"
+BITCOIN_UPSTREAM="${BITCOIN_UPSTREAM_REMOTE}/master"
 ELEMENTS_UPSTREAM_REMOTE=upstream
-export ELEMENTS_UPSTREAM="${ELEMENTS_UPSTREAM_REMOTE}/master"
+ELEMENTS_UPSTREAM="${ELEMENTS_UPSTREAM_REMOTE}/master"
 
-# START USER CONFIG:
-# Set your target upstream here
+# Set these to whether you want to merge from Bitcoin or Elements
 TARGET_UPSTREAM=$BITCOIN_UPSTREAM
 TARGET_NAME="Bitcoin"
-PR_PREFIX="bitcoin/bitcoin"
 # TARGET_UPSTREAM=$ELEMENTS_UPSTREAM
 # TARGET_NAME="Elements"
-# PR_PREFIX="ElementsProject/elements"
 
-# Set your git worktree location here. This is where the merges will be done, and where you should checkout the merged-master branch.
-WORKTREE="/home/byron/code/elements-worktree"
+# BEWARE: On some systems /tmp/ gets periodically cleaned, which may cause
+#   random files from this directory to disappear based on timestamp, and
+#   make git very confused
+WORKTREE="/home/illia/Work/elements-worktree"
+#mkdir -p "${HOME}/.tmp"
 
-# Set your parallellism during build/test. You probably want as many cores as possible.
-# Parallel functional tests can somewhat exceed your core count, depends on the build machine CPU/RAM.
-PARALLEL_BUILD=23  # passed to make -j
-PARALLEL_TEST=46  # passed to test_runner.py --jobs
+PARALLEL_BUILD=15  # passed to cmake --build --parallel
+PARALLEL_TEST=30  # passed to test_runner.py --jobs
 PARALLEL_FUZZ=12  # passed to test_runner.py -j when fuzzing
+BUILD_DIR="build"  # out-of-source CMake build directory
 
 # Setup a ccache dir if necessary.
-#export CCACHE_DIR="/tmp/ccache"
-#export CCACHE_MAXSIZE="20G"
+export CCACHE_DIR="/tmp/ccache"
+export CCACHE_MAXSIZE="10G"
 
 # Set and export a WEBHOOK environment variable to a Discord webhook URL outside of this script to get notifications of progress and failures.
 
@@ -48,6 +47,9 @@ DO_BUILD=1
 KEEP_GOING=1
 DO_TEST=1
 DO_FUZZ=0
+DO_CHERRY=0
+UNDO_CHERRY=0
+ANALYZE=0
 NUM=15
 COUNT=0
 
@@ -165,10 +167,14 @@ notify () {
 ## Sort by unix timestamp and iterate over them
 echo "$COMMITS" | tac | while read -r line
 do
+    ## Skip empty lines (e.g. when there are no commits to process)
+    [[ -z "$line" ]] && continue
+
     ## Extract data and output what we're doing
     HASH=$(echo "$line" | cut -d ' ' -f 3)
     CHAIN=$(echo "$line" | cut -d ' ' -f 4)
-    PR_ID=$(echo "$line" | grep -o -P "#\d+")
+    PR_ID=$(echo "$line" | grep -o -P "#\d+" || true)
+    REPO=$(echo "$line" | grep -o -P '\S+(?=\s*#\d+)' || true)
 
 	GIT_HEAD=$(git rev-parse HEAD)
 
@@ -183,12 +189,12 @@ do
         # CRITICAL_FILES=("src/wallet/spend.h", "src/wallet/spend.cpp")
         MERGE_FILE="/tmp/$HASH.merge"
         DIFF_FILE="/tmp/$HASH.diff"
-        git -C "$WORKTREE" merge "$HASH" --no-ff -m "Merge $HASH into merged_master ($CHAIN PR $PR_PREFIX$PR_ID)" > "$MERGE_FILE" || true
+        git -C "$WORKTREE" merge "$HASH" --no-ff -m "Merge $HASH into merged_master ($CHAIN PR $REPO$PR_ID)" > "$MERGE_FILE" || true
         git -C "$WORKTREE" diff > "$DIFF_FILE"
         git -C "$WORKTREE" reset --hard "$GIT_HEAD" > /dev/null
         # FILES=$(grep "CONFLICT" "$MERGE_FILE")
-        NUM_FILES=$(grep -c "CONFLICT" "$MERGE_FILE")
-        NUM_CONFLICTS=$(grep -c "<<<<<<<" "$DIFF_FILE")
+        NUM_FILES=$(grep -c "CONFLICT" "$MERGE_FILE" || true)
+        NUM_CONFLICTS=$(grep -c "<<<<<<<" "$DIFF_FILE" || true)
         echo "$COUNT. Merge up to $PR_ID ($HASH) has $NUM_CONFLICTS conflicts in $NUM_FILES files."
         if [[ "$COUNT" == "$NUM" ]]; then
             exit 0
@@ -220,22 +226,18 @@ do
         echo -e "Continuing build of \e[37m$PR_ID\e[0m at $(date)"
     else
         echo -e "Start merge/build of \e[37m$PR_ID\e[0m at $(date)"
-        git -C "$WORKTREE" merge "$HASH" --no-ff -m "Merge $HASH into merged_master ($CHAIN PR $PR_PREFIX$PR_ID)" || notify "fail merge" 1
+        git -C "$WORKTREE" merge "$HASH" --no-ff -m "Merge $HASH into merged_master ($CHAIN PR $REPO$PR_ID)" || notify "fail merge" 1
     fi
 
     if [[ "$DO_BUILD" == "1" ]]; then
         # Clean up
         echo "Cleaning up"
-        # NB: this will fail the first time because there's not yet a makefile
-        quietly make distclean || true
+        rm -rf "$BUILD_DIR"
         quietly git -C "$WORKTREE" clean -xf
-        echo "autogen & configure"
-        quietly ./autogen.sh
-        quietly ./configure --with-incompatible-bdb
-        # The following is an expansion of `make check` that skips the libsecp
-        # tests and also the benchmarks (though it does build them!)
+        echo "CMake configure"
+        quietly cmake -B "$BUILD_DIR" -DBUILD_TESTS=ON -DBUILD_BENCH=ON -DBUILD_GUI=ON -DWITH_BDB=ON -DWARN_INCOMPATIBLE_BDB=OFF
         echo "Building"
-        quietly make -j"$PARALLEL_BUILD" -k || notify "fail build" 1
+        quietly cmake --build "$BUILD_DIR" --parallel "$PARALLEL_BUILD" || notify "fail build" 1
         # todo: fix linting step
         # echo "Linting"
         # quietly ./ci/lint/06_script.sh || notify "fail lint"
@@ -243,24 +245,23 @@ do
 
     if [[ "$DO_TEST" == "1" ]]; then
         echo "Testing"
-        quietly ./src/qt/test/test_elements-qt || notify "fail test qt" 1
-        quietly ./src/test/test_bitcoin || notify "fail test bitcoin" 1
-        quietly ./src/bench/bench_bitcoin || notify "fail test bench" 1
-        quietly ./test/util/test_runner.py || notify "fail test util" 1
-        quietly ./test/util/rpcauth-test.py || notify "fail test rpc" 1
+        quietly "$BUILD_DIR"/src/qt/test/test_elements-qt || notify "fail test qt" 1
+        quietly "$BUILD_DIR"/src/test/test_bitcoin || notify "fail test bitcoin" 1
+        quietly "$BUILD_DIR"/src/bench/bench_bitcoin || notify "fail test bench" 1
+        quietly "$BUILD_DIR"/test/util/test_runner.py || notify "fail test util" 1
+        quietly "$BUILD_DIR"/test/util/rpcauth-test.py || notify "fail test rpc" 1
         echo "Functional testing"
-        quietly ./test/functional/test_runner.py --jobs="$PARALLEL_TEST" || notify "fail test runner" 1
+        quietly "$BUILD_DIR"/test/functional/test_runner.py --jobs="$PARALLEL_TEST" || notify "fail test runner" 1
     fi
 
     if [[ "$DO_FUZZ" == "1" ]]; then
         echo "Cleaning for fuzz"
-        quietly make distclean || true
+        rm -rf "$BUILD_DIR"
         quietly git -C "$WORKTREE" clean -xf
         echo "Building for fuzz"
-        quietly ./autogen.sh
         # TODO turn on `,integer` after this rebase
-        quietly ./configure --enable-fuzz --with-sanitizers=address,fuzzer,undefined CC="ccache clang" CXX="ccache clang++"
-        quietly make -j"$PARALLEL_BUILD" -k
+        quietly cmake -B "$BUILD_DIR" -DBUILD_FOR_FUZZING=ON -DSANITIZERS=address,fuzzer,undefined -DCMAKE_C_COMPILER="ccache clang" -DCMAKE_CXX_COMPILER="ccache clang++"
+        quietly cmake --build "$BUILD_DIR" --parallel "$PARALLEL_BUILD"
         echo "Fuzzing"
         quietly ./test/fuzz/test_runner.py -j"$PARALLEL_FUZZ" "${FUZZ_CORPUS}" || notify "fail fuzz" 1
     fi
